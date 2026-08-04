@@ -58,12 +58,13 @@ A full, versioned package list is available in the `sessionInfo()` output at the
 
 If you use this code, please cite the associated manuscript: [ADD FULL CITATION ONCE PUBLISHED]
 
-This repository is also archived on Zenodo with a DOI corresponding to the exact code version used in the publication: [ADD ZENODO DOI BADGE/LINK HERE AFTER STEP 2]
+This repository is also archived on Zenodo with a DOI corresponding to the exact code version used in the publication: [![DOI](https://zenodo.org/badge/1322450324.svg)](https://doi.org/10.5281/zenodo.21783591)
 
 ## Contact
 
-Connor W. Lantz, TamburLab, Northwestern University
-[ADD CONTACT EMAIL]
+Connor W. Lantz, 
+Northwestern University
+connor.lantz@northwestern.edu
 
 ## License
 
