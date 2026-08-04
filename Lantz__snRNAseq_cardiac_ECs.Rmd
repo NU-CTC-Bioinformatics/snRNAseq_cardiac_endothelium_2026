@@ -1,0 +1,1712 @@
+---
+title: "Ischemia Reperfusion in Human Cardiac Endothelium"
+author: "Connor W Lantz"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+# Summary
+
+This study examines single-nucleus RNA sequencing (snRNA-seq) data from the left ventricle of human donor hearts subjected to cold static storage in histidine-tryptophan-ketoglutarate (HTK) solution, with tissue sampled at three timepoints: **Baseline** (immediately after procurement), **10h** of cold storage, and **Perfused** (following reperfusion). Data were obtained from [Lei et al., *Nature Cardiovascular Research* (2025)](https://doi.org/10.1038/s44161-025-00653-x), deposited under GEO accession [GSE261124](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE261124).
+
+The original study also profiled a parallel arm of hearts treated with **canrenone** (a mineralocorticoid receptor antagonist, labeled "CAN" in the raw metadata) to test whether blocking MR phase separation improves preservation outcomes. **This analysis is restricted to the untreated HTK arm only** (Baseline n = 3, 10h n = 3, Perfused n = 1); the canrenone-treated samples are excluded so that transcriptomic changes reflect cold storage/reperfusion alone, without a pharmacological intervention confounding the comparison.
+
+## Analysis Overview
+
+This report proceeds through the following stages, each corresponding to a major section below:
+
+1. **Import & Subsetting** — build the Seurat object from the raw count matrix and isolate the HTK-only samples described above.
+2. **Quality Control** — compute per-nucleus QC metrics, detect doublets (`scDblFinder`), and filter low-quality nuclei using a multi-criteria threshold.
+3. **Normalization & Integration** — cell cycle scoring, `SCTransform` normalization (per sample), and Harmony batch correction (`IntegrateLayers`).
+4. **Cell Annotations** — a resolution sweep and `clustree` analysis to choose a clustering resolution, followed by canonical-marker and unbiased marker-gene validation, and manual assignment of cell-type identities to each cluster.
+5. **Endothelial Cells** — sub-clustering and re-analysis restricted to the three endothelial subtypes (Arterial, Microvascular, Venular).
+6. **Differential Gene Expression** — pairwise MAST comparisons across storage/reperfusion timepoints within the Microvascular EC population.
+
+Panel labels used throughout (e.g., "Figure 1A," "Supplemental Figure 1C") correspond directly to the figure/panel numbers referenced in the associated manuscript.
+
+# Import Data
+
+```{r setup, include=FALSE}
+### Set knitr settings
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+
+### Set Working Directory
+setwd("E:/NM_TRANSPLANT/Nadig_Jaishankar/snRNAseq")
+
+### Load Packages for Analyses
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(Matrix)
+library(cowplot)
+library(tidyverse)
+library(RColorBrewer)
+library(glmGamPoi)
+library(harmony)
+library(MAST)
+library(kableExtra)
+library(patchwork)
+library(gridExtra)
+library(scDblFinder)
+library(SingleCellExperiment)
+library(BiocParallel)
+library(clustree)
+```
+
+```{r colors, include=FALSE}
+
+### Treatment-level palette (matte, no neon — used throughout for Treatment groupings)
+treatment_colors <- c(
+  "HTK Baseline" = "lightsalmon",
+  "HTK 10h" = "firebrick2",
+  "HTK Perfused" = "firebrick4"
+)
+
+### Sample-level palette — three shades per treatment group so individual
+sample_id_colors <- c(
+  "1"  = "#2E6B3E",  # HTK Baseline, sample 1
+  "3"  = "#4C9161",  # HTK Baseline, sample 2
+  "11" = "#7FB894",  # HTK Baseline, sample 3
+  "2"  = "#1B4D6B",  # HTK 10h, sample 1
+  "4"  = "#2E6F94",  # HTK 10h, sample 2
+  "12" = "#6FA3BE",  # HTK 10h, sample 3
+  "14" = "#8B2E2E"   # HTK Perfused (n = 1)
+)
+
+cluster_colors <- c(
+  "0"  = "#4C72B0",  # muted blue
+  "1"  = "#DD8452",  # muted orange
+  "2"  = "#55A868",  # muted green
+  "3"  = "#C44E52",  # muted red
+  "4"  = "#8172B2",  # muted purple
+  "5"  = "#937860",  # muted brown
+  "6"  = "#DA8BC3",  # muted pink
+  "7"  = "#8C8C8C",  # muted gray
+  "8"  = "#CCB974",  # muted olive/gold
+  "9"  = "#64B5CD",  # muted teal
+  "10" = "#A1C9F4",  # pale blue
+  "11" = "#FFB482",  # pale orange
+  "12" = "#8DE5A1",  # pale green
+  "13" = "#FF9F9B",  # pale salmon
+  "14" = "#D0BBFF",  # pale purple
+  "15" = "#DEBB9B",  # pale tan
+  "16" = "#FAB0E4",  # pale pink
+  "17" = "#B9B9B9"   # pale gray
+)
+
+cell_identity_colors <- c(
+  # Endothelial Cells (purple family — 3 subtypes)
+  "Microvascular ECs" = "#CAB2D6",
+  "Venular ECs"       = "#6A3D9A",
+  "Arterial ECs"      = "#3C2456",
+  
+  # Mural Cells (blue family)
+  "Pericytes"         = "#A6CEE3",
+  "VSMCs"             = "#1F78B4",
+  
+  # Cardiomyocytes (orange family — 2 subtypes)
+  "Cardiomyocytes 1"  = "#FF7F00",
+  "Cardiomyocytes 2"  = "#FDD0A2",
+  
+  # Fibroblasts (green family — 2 subtypes)
+  "Fibroblasts 1"     = "#B2DF8A",
+  "Fibroblasts 2"     = "#6A994E",
+  
+  # Immune Cells (red family — 2 subtypes)
+  "Myeloid Cells"     = "#E37777",
+  "Lymphocytes"       = "#B03A3A",
+  
+  # Other
+  "Neurons"           = "#B15928",
+  "Dying Cells"       = "#8C8C8C"
+)
+```
+
+## Create Seurat Object from .h5 File
+
+The raw filtered feature-barcode matrix (`GSM8135503`) was loaded and used to build a `Seurat` object, retaining genes detected in at least 3 cells and nuclei with at least 200 detected genes. Sample identity (`orig.ident`, values 1–15) was mapped to treatment group and storage solution based on the study's sample sheet.
+
+```{r create Seurat, fig.height=5, fig.width=5}
+### Read in .h5 file
+data <- Read10X_h5("E:/NM_TRANSPLANT/Nadig_Jaishankar/snRNAseq/GSM8135503_filtered_feature_bc_matrix.h5")
+
+### Create Seurat object
+Cold_Preserve_Heart <- CreateSeuratObject(counts = data,
+                                          min.cells = 3,
+                                          names.delim = "-",
+                                          names.field = 2,
+                                          min.features = 200)
+
+### Add Metadata
+Idents(Cold_Preserve_Heart) <- "orig.ident"
+Cold_Preserve_Heart <- RenameIdents(Cold_Preserve_Heart, 
+                                    "1" = "HTK Baseline",
+                                    "2" = "HTK 10h",
+                                    "3" = "HTK Baseline",
+                                    "4" = "HTK 10h",
+                                    "5" = "CAN Baseline",
+                                    "6" = "CAN 10h",
+                                    "7" = "CAN Baseline",
+                                    "8" = "CAN 10h",
+                                    "9" = "CAN Baseline",
+                                    "10" = "CAN 10h",
+                                    "11" = "HTK Baseline",
+                                    "12" = "HTK 10h",
+                                    "13" = "CAN Perfused",
+                                    "14" = "HTK Perfused",
+                                    "15" = "CAN Perfused")
+
+Cold_Preserve_Heart$Treatment <- Idents(Cold_Preserve_Heart)
+```
+
+### Sample Summary Before Subsetting
+
+The full dataset spans two preservation arms — untreated (HTK) and canrenone-treated (CAN) — across three timepoints each.
+
+```{r pre-subset table, echo=FALSE}
+pre_subset_tbl <- Cold_Preserve_Heart@meta.data %>%
+  group_by(orig.ident, Treatment) %>%
+  summarise(nCells = n(), .groups = "drop") %>%
+  arrange(Treatment, orig.ident)
+
+pre_subset_tbl %>%
+  kbl(caption = "Samples Before Subsetting (All Treatments)",
+      col.names = c("Sample ID", "Treatment", "Number of Cells"),
+      align = "c",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4A4A4A") %>%
+  column_spec(3, bold = TRUE)
+```
+
+### Subset Samples
+
+Donor hearts preserved in **HTK** solution at Baseline (n = 3), after 10h of cold storage (n = 3), and after reperfusion (n = 1) are isolated for downstream analysis. The canrenone-treated (CAN) arm is excluded so that this analysis reflects cold storage/reperfusion biology alone (see Summary above).
+
+```{r subset HTK}
+# Subset HTK Treatment Data
+Cold_Preserve_Heart <- subset(Cold_Preserve_Heart, idents = c("HTK Baseline", "HTK 10h", "HTK Perfused"))
+
+### Re-level Metadata Categories
+Cold_Preserve_Heart$Treatment <- factor(Cold_Preserve_Heart$Treatment, levels = c("HTK Baseline", "HTK 10h", "HTK Perfused"))
+
+Cold_Preserve_Heart$Sample_ID <- factor(Cold_Preserve_Heart$orig.ident, levels = c("1", "3", "11", "2", "4", "12", "14"))
+```
+
+### Sample Summary After Subsetting
+
+```{r post-subset table, echo=FALSE}
+post_subset_tbl <- Cold_Preserve_Heart@meta.data %>%
+  group_by(orig.ident, Treatment) %>%
+  summarise(nCells = n(), .groups = "drop") %>%
+  arrange(Treatment, orig.ident)
+
+post_subset_tbl %>%
+  kbl(caption = "Samples Retained After Subsetting (HTK Only)",
+      col.names = c("Sample ID", "Treatment", "Number of Cells"),
+      align = "c",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4A4A4A") %>%
+  column_spec(3, bold = TRUE) %>%
+  footnote(general = "Only HTK Baseline, HTK 10h, and HTK Perfused samples retained for downstream analysis.",
+           general_title = "Note: ", footnote_as_chunk = TRUE)
+```
+
+# Quality Control
+
+## Calculating QC Metrics
+
+Standard per-nucleus QC metrics are computed: the novelty score (unique genes detected per UMI, a proxy for library complexity), and the percentage of reads mapping to mitochondrial, ribosomal, and hemoglobin genes. Because this is single-**nucleus** (not single-cell) RNA-seq, cytoplasmic mitochondrial transcripts should already be largely excluded during nuclear isolation — so an elevated `mitoRatio` here is more indicative of ambient/cytoplasmic contamination than of dying cells, and stricter thresholds than typical scRNA-seq QC are applied later.
+
+```{r Calcualting QC metrics}
+# Log Normalization metrics
+Cold_Preserve_Heart$log10GenesPerUMI <- log10(Cold_Preserve_Heart$nFeature_RNA) / log10(Cold_Preserve_Heart$nCount_RNA)
+
+### Mitochondrial
+Cold_Preserve_Heart <- PercentageFeatureSet(Cold_Preserve_Heart, pattern = "^MT-", col.name = "mitoRatio")
+
+### Ribosomal
+Cold_Preserve_Heart <- PercentageFeatureSet(Cold_Preserve_Heart, pattern = "^RP[LS]", col.name = "riboRatio")
+
+### Hemoglobin
+hemo_genes <- grep("^HBA1$|^HBA2$|^HBB$|^HBD$", rownames(Cold_Preserve_Heart), value = TRUE)
+Cold_Preserve_Heart <- PercentageFeatureSet(Cold_Preserve_Heart, features = hemo_genes, col.name = "hemoRatio")
+```
+
+```{r qc summary table, echo=FALSE}
+qc_summary_tbl <- Cold_Preserve_Heart@meta.data %>%
+  group_by(Sample_ID, Treatment) %>%
+  summarise(
+    Mean_nFeature = round(mean(nFeature_RNA), 0),
+    Mean_nCount = round(mean(nCount_RNA), 0),
+    Mean_log10GenesPerUMI = round(mean(log10GenesPerUMI), 3),
+    Mean_mitoRatio = round(mean(mitoRatio), 2),
+    Mean_riboRatio = round(mean(riboRatio), 2),
+    Mean_hemoRatio = round(mean(hemoRatio), 2),
+    .groups = "drop"
+  ) %>%
+  arrange(Treatment, Sample_ID)
+
+qc_summary_tbl %>%
+  kbl(caption = "Average QC Metrics by Sample",
+      col.names = c("Sample ID", "Treatment", "Genes/Cell", "UMIs/Cell",
+                     "log10(Genes/UMI)", "% Mito", "% Ribo", "% Hemo"),
+      align = "c",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4A4A4A") %>%
+  column_spec(3:4, bold = TRUE) %>%
+  footnote(
+    general = "Values represent per-sample means across all nuclei prior to QC filtering.",
+    general_title = "Note: ", footnote_as_chunk = TRUE
+  )
+```
+
+## Calculate Doublets
+
+The [**scDblFinder**](https://github.com/plger/scDblFinder) package gathers various methods for the detection and handling of doublets/multiplets in single-cell sequencing data (i.e., multiple nuclei captured within the same droplet or reaction volume), including the `scDblFinder` method used here. Doublet detection is run **per sample** (`samples = "orig.ident"`) since doublet rates depend on loading concentration and cell recovery, which vary across samples.
+
+```{r Doublets, include=FALSE}
+### Convert Seurat object to SingleCellExperiment (raw counts required)
+sce <- as.SingleCellExperiment(Cold_Preserve_Heart, assay = "RNA")
+
+### Run scDblFinder per-sample to account for sample-specific doublet rates
+set.seed(1234)
+sce <- scDblFinder(sce, samples = "orig.ident", BPPARAM = SerialParam())
+
+### Transfer doublet calls back into Seurat metadata
+Cold_Preserve_Heart$scDblFinder.class <- sce$scDblFinder.class
+Cold_Preserve_Heart$scDblFinder.score <- sce$scDblFinder.score
+```
+
+```{r doublet table, echo=FALSE}
+### Summarize doublet calls per sample
+doublet_tbl <- Cold_Preserve_Heart@meta.data %>%
+  group_by(Sample_ID, Treatment, scDblFinder.class) %>%
+  summarise(nCells = n(), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = scDblFinder.class, values_from = nCells, values_fill = 0) %>%
+  mutate(Percent_Doublet = round(100 * doublet / (singlet + doublet), 2)) %>%
+  arrange(Treatment, Sample_ID)
+
+doublet_tbl %>%
+  kbl(caption = "scDblFinder Doublet Classification by Sample",
+      col.names = c("Sample ID", "Treatment", "Singlets", "Doublets", "% Doublets"),
+      align = "c",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4A4A4A") %>%
+  column_spec(4:5, bold = TRUE)
+```
+
+## QC Metrics
+
+Distributions of the number of UMIs, genes, mitochondrial/ribosomal/hemoglobin content, novelty score, and doublet rate are plotted per sample below to visually confirm sample quality before filtering. The reference lines drawn (500 UMIs, 10% mito, 0.5% ribo, 0.5% hemo, 0.90 novelty score) correspond directly to the thresholds applied in the **Filtering Cells Based on QC** section that follows — they are not exploratory-only guides, but the actual cutoffs used.
+
+```{r Quality Control Metrics, echo=TRUE, fig.height=12, fig.width=8, warning=FALSE}
+### Create Metadata Slot in Merged Seurat
+metadata <- Cold_Preserve_Heart@meta.data
+metadata$cells <- rownames(metadata)
+metadata <- metadata %>%
+  dplyr::rename(seq_folder = orig.ident,
+                nUMI = nCount_RNA,
+                nGene = nFeature_RNA)
+
+#nCells
+p1 <- metadata %>% 
+  ggplot(aes(x=Sample_ID, fill=Sample_ID)) + 
+  geom_bar() +
+  scale_fill_manual(values = sample_id_colors) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("nCells") +
+  NoLegend()
+
+#nUMIs
+p2 <- metadata %>% 
+  ggplot(aes(color = Sample_ID, x = nUMI, fill = Sample_ID)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  scale_color_manual(values = sample_id_colors) +
+  scale_fill_manual(values = sample_id_colors) +
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 500, linetype = "dashed") +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("nUMIs") +
+  NoLegend()
+
+#nGenes 
+p3 <- metadata %>% 
+  ggplot(aes(x=Sample_ID, y=log10(nGene), fill=Sample_ID)) + 
+  geom_boxplot() + 
+  scale_fill_manual(values = sample_id_colors) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("nGenes") +
+  NoLegend()
+
+#mito counts ratio
+p4 <- metadata %>% 
+  ggplot(aes(color=Sample_ID, x=mitoRatio, fill=Sample_ID)) + 
+  geom_density(alpha = 0.1) + 
+  scale_x_log10() + 
+  scale_color_manual(values = sample_id_colors) +
+  scale_fill_manual(values = sample_id_colors) +
+  theme_classic() +
+  geom_vline(xintercept = 10, linetype = "dashed") +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("Mito Ratio") +
+  NoLegend()
+
+#ribo counts ratio
+p5 <- metadata %>% 
+  ggplot(aes(color=Sample_ID, x=riboRatio, fill=Sample_ID)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  scale_color_manual(values = sample_id_colors) +
+  scale_fill_manual(values = sample_id_colors) +
+  theme_classic() +
+  geom_vline(xintercept = 0.5, linetype = "dashed") +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("Ribo Ratio") +
+  NoLegend()
+
+#novelty gene
+p6 <- metadata %>%
+  ggplot(aes(x=log10GenesPerUMI, color = Sample_ID, fill=Sample_ID)) +
+  geom_density(alpha = 0.2) +
+  scale_color_manual(values = sample_id_colors) +
+  scale_fill_manual(values = sample_id_colors) +
+  theme_classic() +
+  geom_vline(xintercept = 0.9, linetype = "dashed") +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("Unique genes per UMI") +
+  NoLegend()
+
+# Hemoglobin ratio by sample — check for elevated blood contamination
+p7 <- metadata %>%
+  ggplot(aes(color = Sample_ID, x = hemoRatio, fill = Sample_ID)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  scale_color_manual(values = sample_id_colors) +
+  scale_fill_manual(values = sample_id_colors) +
+  theme_classic() +
+  geom_vline(xintercept = 0.5, linetype = "dashed") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("Hemoglobin Ratio") +
+  NoLegend()
+
+# Doublet rate by sample
+p8 <- metadata %>%
+  ggplot(aes(x = Sample_ID, fill = scDblFinder.class)) +
+  geom_bar(position = "fill") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ylab("Proportion") +
+  ggtitle("Doublet Rate by Sample") +
+  labs(fill = "Class")
+
+grid.arrange(p1, p2, p3, p4, p5, p6, p7, p8, ncol = 2)
+```
+
+## Filtering Cells Based on QC
+
+Putting the above together, a nucleus is retained only if it passes **all** of the following criteria simultaneously:
+
+| Criterion | Threshold | Rationale |
+|:---|:---:|:---|
+| Novelty score (`log10GenesPerUMI`) | > 0.90 | Excludes low-complexity droplets (e.g., empty droplets, ambient RNA) |
+| UMI count (`nCount_RNA`) | > 500 | Excludes droplets with insufficient sequencing depth |
+| Genes detected (`nFeature_RNA`) | > 250 | Excludes low-complexity or poorly captured nuclei |
+| Mitochondrial content (`mitoRatio`) | < 10% | Excludes dying/damaged cells or cytoplasmic contamination (stricter than typical scRNA-seq given nuclear enrichment) |
+| Hemoglobin content (`hemoRatio`) | < 0.5% | Excludes ambient blood/erythrocyte contamination |
+| Doublet classification | `scDblFinder` singlet only | Excludes multiplets called per-sample |
+
+This is a fairly stringent, multi-criteria filter by design, since it needs to simultaneously exclude empty droplets/low-complexity nuclei, dying (high-mito) cells, blood contamination, and doublets, across samples with different sequencing depths and cell recovery.
+
+```{r Filter, message=FALSE}
+### Subset high-quality cells on QC metrics determined above
+Cold_Preserve_Heart_filtered <- subset(
+  x = Cold_Preserve_Heart,
+  (log10GenesPerUMI > 0.90) &
+    (nCount_RNA > 500) &
+    (nFeature_RNA > 250) &
+    (mitoRatio < 10) &
+    (hemoRatio < 0.5) &
+    (scDblFinder.class == "singlet")
+)
+
+### Build before/after filtering summary table
+pre_filter_n <- table(Cold_Preserve_Heart$Sample_ID)
+post_filter_n <- table(Cold_Preserve_Heart_filtered$Sample_ID)
+
+filter_tbl <- data.frame(
+  Sample_ID = names(pre_filter_n),
+  Treatment = Cold_Preserve_Heart$Treatment[match(names(pre_filter_n), Cold_Preserve_Heart$Sample_ID)],
+  Before = as.integer(pre_filter_n),
+  After = as.integer(post_filter_n[names(pre_filter_n)]),
+  row.names = NULL
+) %>%
+  mutate(
+    Removed = Before - After,
+    Percent_Retained = round(100 * After / Before, 1)
+  ) %>%
+  arrange(Treatment, Sample_ID)
+```
+
+```{r filter table, echo=FALSE}
+filter_tbl %>%
+  kbl(caption = "Cell Counts Before and After QC Filtering",
+      col.names = c("Sample ID", "Treatment", "Before Filtering", "After Filtering", "Removed", "% Retained"),
+      align = "c",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4A4A4A") %>%
+  column_spec(4, bold = TRUE) %>%
+  column_spec(6, bold = TRUE) %>%
+  add_header_above(c(" " = 2, "Cell Counts" = 3, " " = 1)) %>%
+  footnote(
+    general = paste0(
+      "Total: ", sum(filter_tbl$Before), " nuclei before filtering \u2192 ",
+      sum(filter_tbl$After), " nuclei after filtering (",
+      round(100 * sum(filter_tbl$After) / sum(filter_tbl$Before), 1), "% retained overall)."
+    ),
+    general_title = "Summary: ", footnote_as_chunk = TRUE
+  )
+```
+
+# Normalization and Integration
+
+## Cell Cycle Scoring {.tabset .tabset-pills}
+
+Cell cycle phase was scored for each nucleus using the canonical S-phase and G2/M-phase marker gene sets from Tirosh et al. (2015), as implemented in Seurat's `CellCycleScoring()`. The difference between S and G2/M scores (`CC.Difference`) is retained for regression of proliferation-driven variance during normalization (see SCTransform below).
+
+```{r Cell Cycle, include=FALSE}
+### Cell cycle marker gene lists (Tirosh et al., 2015; bundled with Seurat)
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+### Log-normalize RNA assay for cell cycle scoring
+DefaultAssay(Cold_Preserve_Heart_filtered) <- "RNA"
+Cold_Preserve_Heart_filtered <- NormalizeData(Cold_Preserve_Heart_filtered, verbose = FALSE)
+Cold_Preserve_Heart_filtered <- ScaleData(Cold_Preserve_Heart_filtered, verbose = FALSE)
+
+### Score cell cycle phase
+Cold_Preserve_Heart_filtered <- CellCycleScoring(
+  Cold_Preserve_Heart_filtered,
+  s.features = s.genes,
+  g2m.features = g2m.genes,
+  set.ident = FALSE 
+)
+
+### Compute S/G2M score difference (used for regression during SCTransform)
+Cold_Preserve_Heart_filtered$CC.Difference <- Cold_Preserve_Heart_filtered$S.Score - Cold_Preserve_Heart_filtered$G2M.Score
+```
+
+### Plot
+
+```{r cell cycle plot, fig.height=4, fig.width=6}
+phase_colors <- c(
+  "G1"  = "#8C9AA8",   # slate gray-blue
+  "S"   = "#B8A9C9",   # muted lavender
+  "G2M" = "#4A4A4A"    # dark matte gray (consistent with table headers)
+)
+
+plot_cell_cycle <- Cold_Preserve_Heart_filtered@meta.data %>%
+  ggplot(aes(x = Sample_ID, fill = Phase)) +
+  geom_bar(position = "fill", color = "white", linewidth = 0.3) +
+  scale_fill_manual(values = phase_colors, name = "Phase") +
+  scale_y_continuous(labels = scales::percent_format(), expand = c(0, 0)) +
+  labs(
+    title = "Cell Cycle Phase Distribution by Sample",
+    x = "Sample ID",
+    y = "Proportion of Nuclei"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 13),
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    axis.title = element_text(face = "bold"),
+    legend.title = element_text(face = "bold"),
+    legend.position = "right",
+    panel.grid = element_blank()
+  )
+
+plot_cell_cycle
+```
+
+### Table
+
+```{r cell cycle table}
+cc_tbl <- Cold_Preserve_Heart_filtered@meta.data %>%
+  group_by(Sample_ID, Treatment, Phase) %>%
+  summarise(nCells = n(), .groups = "drop") %>%
+  group_by(Sample_ID) %>%
+  mutate(Percent = round(100 * nCells / sum(nCells), 1)) %>%
+  ungroup() %>%
+  tidyr::pivot_wider(
+    id_cols = c(Sample_ID, Treatment),
+    names_from = Phase,
+    values_from = c(nCells, Percent),
+    values_fill = 0
+  ) %>%
+  select(Sample_ID, Treatment,
+         nCells_G1, Percent_G1,
+         nCells_S, Percent_S,
+         nCells_G2M, Percent_G2M) %>%
+  arrange(Treatment, Sample_ID)
+
+cc_tbl %>%
+  kbl(caption = "Cell Cycle Phase Distribution by Sample",
+      col.names = c("Sample ID", "Treatment", "n", "%", "n", "%", "n", "%"),
+      align = "c",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4A4A4A") %>%
+  add_header_above(c(" " = 2, "G1" = 2, "S" = 2, "G2/M" = 2)) %>%
+  footnote(
+    general = "Percentages reflect the proportion of each cell cycle phase within each sample (rows sum to 100%).",
+    general_title = "Note: ", footnote_as_chunk = TRUE
+  )
+```
+
+## SCTransform Normalization
+
+Following QC filtering and cell cycle scoring, the RNA assay was split by sample (`Sample_ID`) prior to normalization, so that each sample's counts are modeled independently — this is required for the downstream Harmony integration step (`IntegrateLayers`), which corrects for sample-level batch effects across separately normalized layers. [**SCTransform**](https://satijalab.org/seurat/articles/sctransform_vignette) (v2 regularization) was applied to each sample layer, regressing out mitochondrial content (`mitoRatio`) and the S/G2M score difference (`CC.Difference`) to remove technical and cell-cycle-associated variance ahead of dimensionality reduction and clustering.
+
+```{r scTransform, echo=FALSE}
+Cold_Preserve_Heart_filtered[["RNA"]] <- split(
+  Cold_Preserve_Heart_filtered[["RNA"]],
+  f = Cold_Preserve_Heart_filtered$Sample_ID)
+
+Cold_Preserve_Heart_filtered <- SCTransform(
+  Cold_Preserve_Heart_filtered,
+  vst.flavor = "v2",
+  vars.to.regress = c("mitoRatio", "CC.Difference"),
+  variable.features.n = 3000,
+  verbose = FALSE
+)
+```
+
+## Harmony Integration of Normalized Datasets
+
+### Assessment of Batch Effects Before Correction {.tabset .tabset-pills}
+
+PCA is run on the SCT-normalized data and an elbow plot inspected to gauge how many PCs capture meaningful variance. This "before" UMAP (computed prior to integration) is the baseline against which the post-Harmony integration is compared in the next step.
+
+```{r PCA Filtered}
+DefaultAssay(Cold_Preserve_Heart_filtered) <- "SCT"
+Cold_Preserve_Heart_filtered <- RunPCA(Cold_Preserve_Heart_filtered, npcs = 30, verbose = FALSE)
+
+# Check how much separation exists by sample/condition before integration --
+# this is the "before" picture to compare against post-integration
+ElbowPlot(Cold_Preserve_Heart_filtered, ndims = 30)
+
+Cold_Preserve_Heart_filtered <- RunUMAP(Cold_Preserve_Heart_filtered, dims = 1:30, reduction = "pca", reduction.name = "umap.unintegrated")
+```
+
+#### Sample ID
+```{r fig.height=9, fig.width=16}
+DimPlot(Cold_Preserve_Heart_filtered,
+        reduction = "umap.unintegrated",
+        split.by = "Sample_ID",
+        cols = treatment_colors,
+        ncol = 3) +
+  NoLegend() +
+    theme(
+      aspect.ratio = 9/16,
+      strip.text = element_text(
+        hjust = 0.5,
+        face = "bold",
+        size = 28,
+        color = "black"
+      ),
+      panel.border = element_rect(
+        color = "black",
+        fill = NA,
+        linewidth = 0.4
+      ),
+      axis.title = element_blank(),
+      axis.text = element_text(
+        size = 20,
+        color = "black"
+      )
+    )
+```
+
+#### Treatment
+```{r fig.height=9, fig.width=16}
+DimPlot(Cold_Preserve_Heart_filtered,
+        reduction = "umap.unintegrated",
+        split.by = "Treatment",
+        cols = treatment_colors) +
+  NoLegend() +
+    theme(
+      aspect.ratio = 9/16,
+      strip.text = element_text(
+        hjust = 0.5,
+        face = "bold",
+        size = 28,
+        color = "black"
+      ),
+      panel.border = element_rect(
+        color = "black",
+        fill = NA,
+        linewidth = 0.4
+      ),
+      axis.title = element_blank(),
+      axis.text = element_text(
+        size = 20,
+        color = "black"
+      )
+    )
+```
+
+### Perform Integration on SCTransform-Normalized Data {.tabset .tabset-pills}
+
+[**Harmony**](https://github.com/immunogenomics/harmony) (via Seurat v5's `IntegrateLayers`) is used to correct for sample/batch effects across the 7 samples while operating on the SCT-normalized values, producing a new `harmony` reduction. A UMAP is recomputed on the Harmony-corrected embedding and split by sample and by treatment; the goal is to confirm that nuclei now mix across samples/conditions within a given cell type rather than separating by batch, which would indicate residual, uncorrected technical variation.
+
+```{r Integration, echo=FALSE}
+### Integration by Harmony Through Seurat
+Cold_Preserve_Heart_filtered <- IntegrateLayers(
+  object = Cold_Preserve_Heart_filtered,
+  method = HarmonyIntegration,
+  normalization.method = "SCT",
+  orig.reduction = "pca",
+  new.reduction = "harmony",
+  verbose = FALSE
+)
+
+### UMAP
+Cold_Preserve_Heart_filtered <- RunUMAP(Cold_Preserve_Heart_filtered, reduction = "harmony", dims = 1:30, reduction.name = "umap.integrated")
+```
+
+#### Sample ID
+```{r fig.height=9, fig.width=16}
+DimPlot(Cold_Preserve_Heart_filtered,
+        reduction = "umap.integrated",
+        split.by = "Sample_ID",
+        cols = treatment_colors,
+        ncol = 3) +
+  NoLegend() +
+    theme(
+      aspect.ratio = 9/16,
+      strip.text = element_text(
+        hjust = 0.5,
+        face = "bold",
+        size = 28,
+        color = "black"
+      ),
+      panel.border = element_rect(
+        color = "black",
+        fill = NA,
+        linewidth = 0.4
+      ),
+      axis.title = element_blank(),
+      axis.text = element_text(
+        size = 20,
+        color = "black"
+      )
+    )
+```
+
+#### Treatment
+```{r fig.height=9, fig.width=16}
+DimPlot(Cold_Preserve_Heart_filtered,
+        reduction = "umap.integrated",
+        split.by = "Treatment",
+        cols = treatment_colors) +
+  NoLegend() +
+    theme(
+      aspect.ratio = 9/16,
+      strip.text = element_text(
+        hjust = 0.5,
+        face = "bold",
+        size = 28,
+        color = "black"
+      ),
+      panel.border = element_rect(
+        color = "black",
+        fill = NA,
+        linewidth = 0.4
+      ),
+      axis.title = element_blank(),
+      axis.text = element_text(
+        size = 20,
+        color = "black"
+      )
+    )
+```
+
+# Cell Annotations
+## Optimal Resolution for Clustering
+### Resolutions Tested
+Rather than committing to a single clustering resolution up front, `FindClusters` is run across a sweep from 0.1 to 1.0 (in steps of 0.1) on the Harmony neighbor graph. Seurat stores each result as its own metadata column (e.g. `SCT_snn_res.0.6`) instead of overwriting, which lets every resolution be inspected/compared before one is chosen for annotation.
+```{r Resolutions, include=FALSE}
+# Run FindClusters across a range of resolutions -- Seurat stores each as
+# a separate metadata column (SCT_snn_res.0.2, SCT_snn_res.0.4, etc.)
+# rather than overwriting, as long as you don't reuse the same cluster.name
+DefaultAssay(Cold_Preserve_Heart_filtered) <- "SCT"
+resolutions <- seq(0.1, 1, by = 0.1)
+
+Cold_Preserve_Heart_filtered <- FindNeighbors(
+  Cold_Preserve_Heart_filtered,
+  reduction = "harmony",
+  dims = 1:30)
+
+Cold_Preserve_Heart_filtered <- FindClusters(
+  Cold_Preserve_Heart_filtered, 
+  resolution = resolutions,
+  verbose = FALSE
+)
+```
+
+```{r fig.height=5, fig.width=15}
+chosen_res <- 0.5
+
+res_dimplots <- lapply(resolutions, function(res) {
+  col <- paste0("SCT_snn_res.", res)
+  n_clusters <- nlevels(factor(Cold_Preserve_Heart_filtered@meta.data[[col]]))
+  is_chosen <- res == chosen_res
+  
+  DimPlot(
+    Cold_Preserve_Heart_filtered,
+    reduction = "umap.integrated",
+    group.by = col,
+    pt.size = 0.4,
+    label = TRUE,
+    label.size = 3,
+    label.color = "black",
+    cols = cluster_colors,
+    repel = TRUE
+  ) +
+    ggtitle(paste0("Resolution ", res),
+            subtitle = paste0(n_clusters, " clusters")) +
+    NoLegend() +
+    theme(
+      aspect.ratio = 9/16,
+      plot.title = element_text(
+        hjust = 0.5, face = "bold", size = 13,
+        color = if (is_chosen) "firebrick3" else "black"
+      ),
+      plot.subtitle = element_text(hjust = 0.5, size = 10, color = "grey30"),
+      panel.border = element_rect(
+        color = if (is_chosen) "firebrick3" else "black",
+        fill = NA,
+        linewidth = if (is_chosen) 1 else 0.4
+      ),
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+})
+
+wrap_plots(res_dimplots, ncol = 5) +
+  plot_annotation(
+    title = "Clustering Across Resolutions (SCT, Harmony-Integrated)",
+    theme = theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 16))
+  )
+```
+
+### Clustering Tree of resolutions between 0-1
+A `clustree` plot visualizes how clusters split and merge as resolution increases, which is a more principled way to pick a working resolution than eyeballing UMAPs alone: it highlights where a resolution increase adds a genuinely new, stable branch versus where it just fragments an existing population. Resolution **0.5** was chosen here (boxed) as the point that resolves the expected major immune/stromal/parenchymal populations without visibly over-splitting into unstable, low-cell-count clusters.
+```{r fig.height=6, fig.width=15} 
+Clustree_plot <- clustree(
+  Cold_Preserve_Heart_filtered,
+  prefix = "SCT_snn_res.",
+  node_colour = "cluster",
+  node_text_size = 4,
+  edge_width = 1.5
+) +
+  guides(edge_alpha = "none", edge_colour = "none", colour = "none") +
+  scale_colour_manual(values = cluster_colors, name = "Cluster") +
+  scale_size(name = "Cluster\nSize", range = c(5, 15)) +
+  ggtitle("Clustering Stability Across Resolutions",
+          subtitle = "Node color matches cluster identity in DimPlots above") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 15),
+    plot.subtitle = element_text(hjust = 0.5, size = 11, color = "grey30"),
+    legend.position = "right",
+    legend.title = element_text(face = "bold")
+  )
+
+### Pull node layout data for row labels + resolution highlight
+res_col <- "SCT_snn_res."   # matches the `prefix` argument above
+node_data <- Clustree_plot$data
+
+### Build one label per resolution row, positioned left of the leftmost node
+row_label_df <- node_data %>%
+  distinct(.data[[res_col]], y) %>%
+  arrange(y) %>%
+  mutate(label = paste0("Resolution ", format(.data[[res_col]], nsmall = 1)))
+
+left_edge <- min(node_data$x) - 1.2   # padding so labels don't overlap nodes
+
+Clustree_plot <- Clustree_plot +
+  geom_text(
+    data = row_label_df,
+    aes(x = left_edge, y = y, label = label),
+    inherit.aes = FALSE,
+    hjust = 1, fontface = "bold", size = 3.3, color = "grey20"
+  ) +
+  coord_cartesian(clip = "off") +
+  theme(plot.margin = margin(5.5, 5.5, 5.5, 90))
+
+### Highlight the chosen resolution row (kept from before)
+chosen_res <- 0.5
+y_range <- range(node_data$y[node_data[[res_col]] == chosen_res], na.rm = TRUE)
+
+Clustree_plot <- Clustree_plot +
+  annotate("rect",
+           xmin = -11, xmax = Inf,
+           ymin = y_range[1] - 0.4, ymax = y_range[2] + 0.4,
+           fill = "white", alpha = 0.02, color = "gray5", linewidth = 0.8)
+
+Clustree_plot
+```
+
+### Clustering trees with nodes colored by canonical marker expression
+As a second check on the resolution choice, the same clustree layout is recolored by mean expression of canonical lineage markers. A good resolution should show each canonical marker "lighting up" a distinct, coherent branch rather than being smeared across multiple unrelated branches.
+```{r fig.height=8, fig.width=20}
+markers_to_check <- c(
+  "CDH5", # Endothelial Cells
+  "TNNT2", # Cardiomyocytes
+  "FBN1", # Fibroblasts
+  "NRXN1", # Neurons
+  "ACTA2", # Smooth Muscle Cells/Pericytes
+  "MYH11", # VSMCs
+  "PDGFRB", # Pericytes
+  "PTPRC",
+  "CD68",
+  "mitoRatio" 
+)
+
+# Canonical cell-type identity for each marker, used to label each panel
+marker_cell_types <- c(
+  "CDH5"   = "Endothelial Cells",
+  "TNNT2"  = "Cardiomyocytes",
+  "FBN1"   = "Fibroblasts",
+  "NRXN1"  = "Neurons",
+  "ACTA2"  = "Smooth Muscle Cells / Pericytes",
+  "MYH11"  = "Smooth Muscle Cells (VSMCs)",
+  "PDGFRB" = "Pericytes / Mural Cells",
+  "PTPRC"  = "Leukocytes (CD45+)",
+  "CD68" = "Macrophage",
+  "mitoRatio"  = "Dying Cells"
+)
+
+# Build one small clustree per marker, stripped down for a compact multi-panel layout
+make_marker_clustree <- function(gene) {
+  clustree(
+    Cold_Preserve_Heart_filtered,
+    prefix = "SCT_snn_res.",
+    node_colour = gene,
+    node_colour_aggr = "mean",
+    exprs = "data",
+    node_size_range = c(2, 5),
+    node_text_size = 4,
+    edge_width = 0.25
+  ) +
+    scale_color_gradient(low = "gray75", high = "firebrick", name = "Mean\nExpression") +
+    ggtitle(gene, subtitle = marker_cell_types[[gene]]) +
+    annotate("rect",
+           xmin = -Inf, xmax = Inf,
+           ymin = which(resolutions == chosen_res) - 0.5,
+           ymax = which(resolutions == chosen_res) + 0.5,
+           fill = "white", alpha = 0.0, color = "gray5", linewidth = 0.5) +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      plot.subtitle = element_text(hjust = 0.5, size = 10, color = "grey30"),
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+}
+
+marker_plots <- lapply(markers_to_check, make_marker_clustree)
+names(marker_plots) <- markers_to_check
+
+# Arrange as a 2x4 grid, matching the reference figure's two rows of four
+wrap_plots(marker_plots, ncol = 5)
+```
+
+### UMAPs of Marker Expression
+The resolution-0.5 clustering is shown alongside these module scores below, giving a first-pass visual match between clusters and candidate identities before formal marker-based annotation.
+```{r fig.height=5, fig.width=15}
+# --- Left panel: DimPlot at resolution 0.6, square, spanning both rows ---
+DimPlot_res0.5 <- DimPlot(
+  Cold_Preserve_Heart_filtered,
+  reduction = "umap.integrated",
+  group.by = "SCT_snn_res.0.5",
+  label = TRUE,
+  label.size = 4,
+  repel = TRUE
+) +
+  ggtitle("Resolution 0.5") +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    aspect.ratio = 1  # forces square panel
+  )
+
+# --- Right panel: your existing feature plot code, unchanged ---
+DefaultAssay(Cold_Preserve_Heart_filtered) <- "SCT"
+
+FeaturePlot_Cell_Markers <- FeaturePlot(Cold_Preserve_Heart_filtered,
+                                        features = markers_to_check, 
+                                        reduction = "umap.integrated",
+                                        order = T, 
+                                        cols = c("gray89", "firebrick4"), 
+                                        min.cutoff = ("q50"),
+                                        max.cutoff = ("q95"),
+                                        combine = F)
+
+for(i in 1:length(FeaturePlot_Cell_Markers)) {
+  FeaturePlot_Cell_Markers[[i]] <- FeaturePlot_Cell_Markers[[i]] + 
+  guides(color = guide_legend(override.aes = list(size=4), ncol=1)) +
+  theme(plot.title = element_text(hjust = 0.5, face = "italic", size = rel(1)),
+        axis.ticks = element_blank(), axis.text = element_blank(), axis.title = element_blank(), axis.line = element_blank()) +
+  NoLegend()
+  
+  FeaturePlot_Cell_Markers[[i]] <-  ggdraw() + 
+  draw_plot(FeaturePlot_Cell_Markers[[i]]) +
+  geom_segment(aes(x=0, y=0, xend=0.25, yend=0), arrow = arrow(length=unit(0.2, 'cm'), type = "closed")) +
+  geom_segment(aes(x=0, y=0, xend=0, yend=0.3), arrow = arrow(length=unit(0.2, 'cm'), type = "closed"))
+}
+
+FeaturePlot_Cell_Markers_grid <- cowplot::plot_grid(plotlist = FeaturePlot_Cell_Markers, ncol = 4)
+
+FeaturePlot_Cell_Markers_grid <- plot_grid(NULL, FeaturePlot_Cell_Markers_grid, NULL, NULL,
+                                        nrow = 2,
+                                        rel_widths = c(0.05, 0.95),
+                                        rel_heights = c(0.94, 0.06))
+
+# --- Combine: square DimPlot (30% width) on left, feature grid (70%) on right ---
+combined_figure <- plot_grid(
+  DimPlot_res0.5,
+  FeaturePlot_Cell_Markers_grid,
+  nrow = 1,
+  rel_widths = c(0.2, 0.8)
+)
+
+combined_figure
+```
+
+### Find Markers to Identify Each Cluster
+Finally, an unbiased marker search (`FindAllMarkers`, Wilcoxon test on the SCT assay, positive markers only, ≥25% detection in-cluster, ≥0.25 log2FC) is run across all sub-clusters to complement the hypothesis-driven canonical-marker and module-score approaches above. `PrepSCTFindMarkers` is run first, which is required whenever comparing across clusters built from per-sample SCT models, so that corrected counts are on a comparable scale before differential testing. The full table is written out for supplementary use, and the top markers per cluster are tabulated below.
+```{r Find Markers}
+DefaultAssay(Cold_Preserve_Heart_filtered) <- "SCT"
+Idents(Cold_Preserve_Heart_filtered) <- "SCT_snn_res.0.5"
+
+# Required before FindAllMarkers when working with SCT assay across multiple
+# samples/models -- recalculates corrected counts so markers are comparable
+# across clusters that may draw from different per-sample SCT models
+Cold_Preserve_Heart_filtered <- PrepSCTFindMarkers(Cold_Preserve_Heart_filtered)
+
+all_markers <- FindAllMarkers(
+  Cold_Preserve_Heart_filtered,
+  assay = "SCT",
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25,
+  verbose = TRUE
+)
+
+top_markers <- all_markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 10) %>%
+  ungroup() %>%
+  select(cluster, gene, avg_log2FC, pct.1, pct.2, p_val_adj)
+
+top_markers %>%
+  mutate(
+    avg_log2FC = round(avg_log2FC, 2),
+    pct.1 = round(pct.1, 2),
+    pct.2 = round(pct.2, 2),
+    p_val_adj = formatC(p_val_adj, format = "e", digits = 2)
+  ) %>%
+  kbl(
+    caption = "Top markers per cluster",
+    col.names = c("Cluster", "Gene", "avg log2FC", "% expr (cluster)", "% expr (rest)", "Adj. p-value"),
+    align = "clccccc"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    font_size = 12
+  ) %>%
+  collapse_rows(columns = 1, valign = "top") %>%
+  row_spec(0, bold = TRUE)
+```
+
+```{r eval=FALSE, include=FALSE}
+# Save the full marker table for reference/supplementary material
+write.csv(all_markers, 
+          file = "E:/NM_TRANSPLANT/Nadig_Jaishankar/snRNAseq/all_cluster_markers.csv",
+          row.names = FALSE)
+```
+
+
+### Rename Identities for Seurat Clusters
+Cluster identities are assigned from the combination of canonical markers, module scores, and the unbiased marker search above.
+```{r}
+Idents(Cold_Preserve_Heart_filtered) <- "SCT_snn_res.0.5"
+
+Cold_Preserve_Heart_filtered <- RenameIdents(Cold_Preserve_Heart_filtered, 
+                                     "0" = "Fibroblasts 1",
+                                     "1" = "Microvascular ECs",
+                                     "2" = "Pericytes",
+                                     "3" = "Cardiomyocytes 1",
+                                     "4" = "Myeloid Cells",
+                                     "5" = "Venular ECs",
+                                     "6" = "Dying Cells",
+                                     "7" = "Cardiomyocytes 2",
+                                     "8" = "VSMCs",
+                                     "9" = "Arterial ECs",
+                                     "10" = "Fibroblasts 2",
+                                     "11" = "Neurons",
+                                     "12" = "Lymphocytes")
+
+Cold_Preserve_Heart_filtered$cell.annotation <- Idents(Cold_Preserve_Heart_filtered)
+```
+
+The table below summarizes the evidence used for each cluster assignment, drawing on the canonical markers, module-score clustree panels, and unbiased `FindAllMarkers` results above.
+
+```{r cluster annotation summary, echo=FALSE}
+cluster_annotation_summary <- data.frame(
+  Cluster = as.character(0:12),
+  Identity = c("Fibroblasts 1", "Microvascular ECs", "Pericytes", "Cardiomyocytes 1",
+               "Myeloid Cells", "Venular ECs", "Dying Cells", "Cardiomyocytes 2",
+               "VSMCs", "Arterial ECs", "Fibroblasts 2", "Neurons", "Lymphocytes"),
+  Key_Markers = c("FBN1", "CDH5, PECAM1", "PDGFRB, RGCC", "TNNT2",
+                  "PTPRC, CD68", "CDH5, ACKR1", "High mitoRatio, low library complexity",
+                  "TNNT2", "MYH11, ACTA2", "CDH5, GJA5", "FBN1", "NRXN1", "PTPRC")
+)
+
+cluster_annotation_summary %>%
+  kbl(caption = "Cluster Identity Assignments and Supporting Markers",
+      col.names = c("Cluster", "Assigned Identity", "Key Supporting Marker(s)"),
+      align = "c",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4A4A4A") %>%
+  column_spec(2, bold = TRUE) %>%
+  footnote(
+    general = "Clusters correspond to SCT_snn_res.0.5. \"Dying Cells\" reflects a population with elevated mitochondrial content and low library complexity rather than a distinct canonical lineage marker; see QC discussion above.",
+    general_title = "Note: ", footnote_as_chunk = TRUE
+  )
+```
+
+### Figure 1A: UMAP of Annotated Clusters {.tabset .tabset-pills}
+#### Cell Type
+```{r fig.height=4, fig.width=8}
+Dimplot <- DimPlot(
+                  Cold_Preserve_Heart_filtered,
+                  reduction = "umap.integrated",
+                  group.by = "cell.annotation",
+                  label = F, 
+                  cols = cell_identity_colors,
+                  pt.size = 0.1) +
+  
+  guides(color = guide_legend(override.aes = list(size=6), ncol=1)) +
+  
+  # Arrows
+  geom_segment(aes(x=-14, y=-14, xend=-9, yend=-14), linewidth = 1, arrow = arrow(length=unit(0.3, 'cm'),  type = "closed")) +
+  geom_segment(aes(x=-14, y=-14, xend=-14, yend=-7), linewidth = 1, arrow = arrow(length=unit(0.3, 'cm'), type = "closed")) +
+  
+  #Labels
+  labs(x = "UMAP-1",
+       y = "UMAP-2") +
+  theme_void() +
+  theme(
+    aspect.ratio = 1/1.43,
+    plot.title = element_blank(),
+    axis.title.x = element_text(hjust = 0.05, vjust = 3.25, face = "bold", family = "serif", size = rel(1.2)),
+    axis.title.y = element_text(hjust = 0.05, vjust = -4, angle=90, face = "bold", family = "serif", size = rel(1.2)),
+    legend.text = element_text(family = "serif", size = rel(1.4)))
+  
+Dimplot
+```
+
+#### Treatment
+```{r fig.height=4, fig.width=8}
+Dimplot <- DimPlot(
+                  Cold_Preserve_Heart_filtered,
+                  reduction = "umap.integrated",
+                  group.by = "Treatment",
+                  label = F, 
+                  cols = treatment_colors,
+                  pt.size = 0.1) +
+  
+  guides(color = guide_legend(override.aes = list(size=6), ncol=1)) +
+  
+  # Arrows
+  geom_segment(aes(x=-14, y=-14, xend=-9, yend=-14), linewidth = 1, arrow = arrow(length=unit(0.3, 'cm'),  type = "closed")) +
+  geom_segment(aes(x=-14, y=-14, xend=-14, yend=-7), linewidth = 1, arrow = arrow(length=unit(0.3, 'cm'), type = "closed")) +
+  
+  #Labels
+  labs(x = "UMAP-1",
+       y = "UMAP-2") +
+  theme_void() +
+  theme(
+    aspect.ratio = 1/1.43,
+    plot.title = element_blank(),
+    axis.title.x = element_text(hjust = 0.05, vjust = 3.25, face = "bold", family = "serif", size = rel(1.2)),
+    axis.title.y = element_text(hjust = 0.05, vjust = -4, angle=90, face = "bold", family = "serif", size = rel(1.2)),
+    legend.text = element_text(family = "serif", size = rel(1.4)))
+  
+Dimplot
+```
+
+### Supplemental Figure 1A: Cell-type Marker Expression
+```{r fig.height=6, fig.width=18}
+DefaultAssay(Cold_Preserve_Heart_filtered) <- "SCT"
+
+features.markers <- c("CDH5", "TNNT2", "FBN1", "NRXN1", "mitoRatio", "ACTA2", "MYH11", "PDGFRB", "PTPRC", "CD68")
+
+FeaturePlot_Cell_Markers <- FeaturePlot(Cold_Preserve_Heart_filtered, reduction = "umap.integrated", features = features.markers, order = T, cols = c("gray89", "firebrick4"), min.cutoff = ("q30"), max.cutoff = ("q90"), combine = F)
+
+for(i in 1:length(FeaturePlot_Cell_Markers)) {
+  FeaturePlot_Cell_Markers[[i]] <- FeaturePlot_Cell_Markers[[i]] + 
+    guides(color = guide_colorbar(
+      title = "Expression",          # legend title = gene name
+      barwidth = 0.75, barheight = 4,          # adjust size
+      frame.colour = "black", frame.linewidth = 0.1,
+      ticks = TRUE, ticks.colour = "black"
+    )) +
+  theme(plot.title = element_text(hjust = 0.6, face = "bold.italic", family = "serif", size = rel(1.5)),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.line = element_blank(),
+        legend.title = element_text(family = "serif", size = 12),
+        legend.text = element_text(family = "serif", size = 10)) 
+  
+  FeaturePlot_Cell_Markers[[i]] <-  ggdraw() + 
+  draw_plot(FeaturePlot_Cell_Markers[[i]]) +
+  geom_segment(aes(x=0, y=0, xend=0.2, yend=0), arrow = arrow(length=unit(0.2, 'cm'), type = "closed"), lwd = 1) +
+  geom_segment(aes(x=0, y=0, xend=0, yend=0.3), arrow = arrow(length=unit(0.2, 'cm'), type = "closed"), lwd = 1)
+  
+}
+
+FeaturePlot_Cell_Markers <- cowplot::plot_grid(plotlist = FeaturePlot_Cell_Markers, ncol = 5) + theme(plot.margin = margin(10, 10, 10, 10))
+FeaturePlot_Cell_Markers
+```
+
+```{r eval=FALSE, include=FALSE}
+saveRDS(Cold_Preserve_Heart_filtered, file = "E:/NM_TRANSPLANT/Nadig_Jaishankar/snRNAseq/Cold_Preserve_Heart_filtered.rds")
+```
+
+# Endothelial Cells
+As stated in the Summary, this study's central question concerns gene expression regulation in endothelial cells during cold storage and reperfusion. The remainder of this report therefore focuses specifically on the three endothelial subtypes identified above — Arterial, Microvascular, and Venular ECs — re-analyzed as an isolated subset so that downstream visualizations and differential expression testing are not diluted by the other 10 non-endothelial populations.
+
+## Subset Endothelial cells
+```{r}
+Idents(Cold_Preserve_Heart_filtered) <- "cell.annotation"
+Endothelial_Cells <- subset(Cold_Preserve_Heart_filtered, idents = c("Arterial ECs", "Microvascular ECs", "Venular ECs"))
+```
+
+### Figure 1B: UMAP of Endothelial Cell Clusters
+The three endothelial subtypes are visualized independently of the full-heart UMAP above (Figure 1A), re-plotted here on the same Harmony-integrated embedding but cropped to the region occupied by endothelial nuclei, and colored first by cell type and then by treatment to assess whether storage/reperfusion shifts the balance of EC subtypes or induces distinct transcriptional states within a subtype.
+
+#### Cell Type
+```{r fig.height=4, fig.width=7}
+Idents(Endothelial_Cells) <- Endothelial_Cells$cell.annotation
+Dimplot <- DimPlot(Endothelial_Cells,
+                   reduction = "umap.integrated",
+                   label = F, 
+                   cols = cell_identity_colors,
+                   pt.size = 1.25) +
+  scale_y_continuous(limits = c(-9, 0)) +
+  scale_x_continuous(limits = c(-3, 7)) +
+  
+  guides(color = guide_legend(override.aes = list(size=6), ncol=1)) +
+  
+  # Arrows
+  geom_segment(aes(x=-3,
+                   y=-9,
+                   xend=-1,
+                   yend=-9),
+               linewidth = 1,
+               arrow = arrow(length=unit(0.3, 'cm'),
+                             type = "closed")) +
+  
+  geom_segment(aes(x=-3,
+                   y=-9,
+                   xend=-3,
+                   yend=-6.25),
+               linewidth = 1,
+               arrow = arrow(length=unit(0.3, 'cm'),
+                             type = "closed")) +
+  
+  #Labels
+  labs(x = "UMAP-1",
+       y = "UMAP-2") +
+  theme_void() +
+  theme(
+    aspect.ratio = 1/1.43,
+    plot.title = element_blank(),
+    axis.title.x = element_text(hjust = 0.05,
+                                vjust = 3.25,
+                                face = "bold",
+                                family = "serif",
+                                size = rel(1.2)),
+    axis.title.y = element_text(hjust = 0.05,
+                                vjust = -4,
+                                angle=90,
+                                face = "bold",
+                                family = "serif",
+                                size = rel(1.2)),
+    legend.text = element_text(family = "serif",
+                               size = rel(1.4)))
+  
+Dimplot
+```
+
+#### Treatment
+```{r fig.height=4, fig.width=7}
+Idents(Endothelial_Cells) <- Endothelial_Cells$Treatment
+Dimplot <- DimPlot(Endothelial_Cells,
+                   reduction = "umap.integrated",
+                   label = F, 
+                   cols = treatment_colors,
+                   pt.size = 1.25) +
+  scale_y_continuous(limits = c(-9, 0)) +
+  scale_x_continuous(limits = c(-3, 7)) +
+  
+  guides(color = guide_legend(override.aes = list(size=6), ncol=1)) +
+  
+  # Arrows
+  geom_segment(aes(x=-3,
+                   y=-9,
+                   xend=-1,
+                   yend=-9),
+               linewidth = 1,
+               arrow = arrow(length=unit(0.3, 'cm'),
+                             type = "closed")) +
+  
+  geom_segment(aes(x=-3,
+                   y=-9,
+                   xend=-3,
+                   yend=-6.25),
+               linewidth = 1,
+               arrow = arrow(length=unit(0.3, 'cm'),
+                             type = "closed")) +
+  
+  #Labels
+  labs(x = "UMAP-1",
+       y = "UMAP-2") +
+  theme_void() +
+  theme(
+    aspect.ratio = 1/1.43,
+    plot.title = element_blank(),
+    axis.title.x = element_text(hjust = 0.05,
+                                vjust = 3.25,
+                                face = "bold",
+                                family = "serif",
+                                size = rel(1.2)),
+    axis.title.y = element_text(hjust = 0.05,
+                                vjust = -4,
+                                angle=90,
+                                face = "bold",
+                                family = "serif",
+                                size = rel(1.2)),
+    legend.text = element_text(family = "serif",
+                               size = rel(1.4)))
+  
+Dimplot
+```
+
+### Supplemental Figure 1B: Endothelial Marker Expression
+Endothelial Marker Expression
+Expression of established zonation markers is plotted across the endothelial UMAP to confirm the arterial/microvascular/venular assignments from Figure 1B: pan-endothelial markers (`PECAM1`, `VWF`) should be broadly expressed across all three populations, while `GJA5`/`SEMA3G` mark arterial endothelium, `RGCC`/`SLCO2A1`/`FCN3` mark capillary/microvascular endothelium, and `ACKR1` marks venular endothelium.
+```{r fig.height=8, fig.width=12}
+DefaultAssay(Endothelial_Cells) <- "SCT"
+
+features.markers <- c("PECAM1", "VWF", "PROX1", "GJA5", "RGCC", "SLCO2A1", "SEMA3G", "FCN3", "ACKR1")
+
+FeaturePlot_Cell_Markers <- FeaturePlot(Endothelial_Cells,
+                                        reduction = "umap.integrated",
+                                        features = features.markers,
+                                        order = T,
+                                        cols = c("gray89", "firebrick4"),
+                                        min.cutoff = ("q30"),
+                                        max.cutoff = ("q90"),
+                                        combine = F)
+
+for(i in 1:length(FeaturePlot_Cell_Markers)) {
+  FeaturePlot_Cell_Markers[[i]] <- FeaturePlot_Cell_Markers[[i]] + 
+    scale_y_continuous(limits = c(-9, 0)) +
+    scale_x_continuous(limits = c(-3, 7)) +
+    guides(color = guide_colorbar(
+      title = "Expression",          # legend title = gene name
+      barwidth = 0.75, barheight = 4,          # adjust size
+      frame.colour = "black", frame.linewidth = 0.1,
+      ticks = TRUE, ticks.colour = "black"
+    )) +
+  theme(plot.title = element_text(hjust = 0.6, face = "bold.italic", family = "serif", size = rel(1.5)),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.line = element_blank(),
+        legend.title = element_text(family = "serif", size = 12),
+        legend.text = element_text(family = "serif", size = 10)) 
+  
+  FeaturePlot_Cell_Markers[[i]] <-  ggdraw() + 
+  draw_plot(FeaturePlot_Cell_Markers[[i]]) +
+  geom_segment(aes(x=0, y=0, xend=0.2, yend=0), arrow = arrow(length=unit(0.2, 'cm'), type = "closed"), lwd = 1) +
+  geom_segment(aes(x=0, y=0, xend=0, yend=0.3), arrow = arrow(length=unit(0.2, 'cm'), type = "closed"), lwd = 1)
+  
+}
+
+FeaturePlot_Cell_Markers <- cowplot::plot_grid(plotlist = FeaturePlot_Cell_Markers, ncol = 3) + theme(plot.margin = margin(10, 10, 10, 10))
+FeaturePlot_Cell_Markers
+```
+
+### Figure 1C: DotPlot of EC Markers
+Canonical zonation markers are summarized as a dot plot, with dot size reflecting the percentage of nuclei expressing each gene within a subtype and color reflecting scaled average expression. Cell types are ordered along the arterial-to-venous vascular axis (Arterial → Microvascular → Venular) for the remainder of the report, so panels can be compared directly against one another without re-checking axis order each time.
+```{r fig.height=2, fig.width=10}
+Endothelial_Cells$cell.annotation <- factor(Endothelial_Cells$cell.annotation, levels = c("Venular ECs", "Microvascular ECs", "Arterial ECs"))
+```
+
+```{r fig.height=3, fig.width=12}
+Idents(Endothelial_Cells) <- "cell.annotation"
+DefaultAssay(Endothelial_Cells) <- "SCT"
+features.markers <- c("PECAM1", "VWF", "FLT1", "GJA5", "SEMA3G", "LTBP4", "CD36", "RGCC", "TCF15", "SLCO2A1", "VCAM1", "ACKR1")
+
+Dotplot <- DotPlot(Endothelial_Cells, features = features.markers, cols = c("gray95", "deepskyblue4")) + 
+  theme(axis.title = element_blank(),
+        axis.text.x = element_text(family = "serif",
+                                   angle = 45, 
+                                   vjust = 1,
+                                   hjust = 1,
+                                   size = 18),
+        axis.text.y = element_text(family = "serif",
+                                   size = 18),
+        legend.text = element_text(family = "serif"),
+        legend.title = element_text(family = "serif"),
+        legend.position = "right",
+        legend.box = "horizontal",
+        legend.margin = margin(t = 2)
+        )
+
+Dotplot
+```
+
+### Supplemental Figure 1C: Supplemental Figure 1C: Endothelial Subtype Composition by Treatment
+This table reports the number and proportion of each endothelial subtype within each treatment group, to assess whether cold storage or reperfusion shifts the relative abundance of arterial, microvascular, or venular endothelium (as opposed to — or in addition to — shifting gene expression within a given subtype). The corresponding bar graph for the manuscript figure was generated externally in GraphPad Prism using the values in this table.
+```{r}
+ec_annotation_tbl <- as.data.frame(table(Endothelial_Cells$Treatment, Endothelial_Cells$cell.annotation)) %>%
+  dplyr::rename(Treatment = Var1, Cell_Type = Var2, nCells = Freq) %>%
+  group_by(Treatment) %>%
+  mutate(Percent = round(100 * nCells / sum(nCells), 1)) %>%
+  ungroup() %>%
+  tidyr::pivot_wider(
+    id_cols = Treatment,
+    names_from = Cell_Type,
+    values_from = c(nCells, Percent),
+    values_fill = 0
+  )
+
+### Reorder columns so each cell type's n and % sit next to each other
+cell_types <- levels(factor(Endothelial_Cells$cell.annotation))
+col_order <- c("Treatment", as.vector(rbind(paste0("nCells_", cell_types), paste0("Percent_", cell_types))))
+ec_annotation_tbl <- ec_annotation_tbl[, col_order]
+
+ec_annotation_tbl %>%
+  kbl(caption = "Endothelial Cell Subtype Composition by Treatment (Supplemental Figure 1C)",
+      col.names = c("Treatment", rep(c("n", "%"), length(cell_types))),
+      align = "c",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4A4A4A") %>%
+  add_header_above(setNames(rep(2, length(cell_types)), cell_types) %>% c(" " = 1, .)) %>%
+  footnote(
+    general = "Percentages reflect the proportion of each endothelial subtype within each treatment group (rows sum to 100%).",
+    general_title = "Note: ", footnote_as_chunk = TRUE
+  )
+```
+
+### Supplemental Figure 1D: Heatmap of EC Markers
+To complement the hypothesis-driven zonation markers in Figure 1C, an unbiased marker search (`FindAllMarkers`, RNA assay, positive markers only) is run across the three EC subtypes, and the top markers per subtype (log2FC > 1, up to 15 genes) are visualized as a heatmap of scaled expression across individual nuclei. This provides an unbiased check that the arterial/microvascular/venular distinction is supported by many genes beyond the small canonical panel used above.
+
+```{r}
+Idents(Endothelial_Cells) <- "cell.annotation"
+DefaultAssay(Endothelial_Cells) <- "RNA"
+
+### Join the split RNA layers — required before any DE test, even when
+### the DefaultAssay is SCT, since FindMarkers/FindAllMarkers still
+### references the underlying RNA layers internally
+Endothelial_Cells[["RNA"]] <- JoinLayers(Endothelial_Cells[["RNA"]])
+
+Endothelial_Cells.markers <- FindAllMarkers(Endothelial_Cells, only.pos = TRUE)
+
+Endothelial_Cells.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = 15) %>%
+    ungroup() -> top10
+```
+
+```{r fig.height=9, fig.width=6}
+DefaultAssay(Endothelial_Cells) <- "RNA"
+Endothelial_Cells$cell.annotation <- factor(Endothelial_Cells$cell.annotation, levels = c("Arterial ECs", "Microvascular ECs", "Venular ECs"))
+
+Idents(Endothelial_Cells) <- "cell.annotation"
+EC_Markers_Heatmap <- DoHeatmap(Endothelial_Cells,
+                                features = top10$gene,
+                                group.colors = cell_identity_colors,
+                                label = T,
+                                size = 3.5,
+                                group.bar.height = 0.04)  +
+  guides(color = FALSE) + 
+  scale_fill_gradient2(
+    low = "white",   # negative
+    high = "firebrick4",        # positive
+    midpoint = 0         
+  ) +
+  theme(legend.position = "bottom",
+        legend.title = element_text(color = "black",face = "bold.italic", family = "serif"),
+        axis.text.y = element_text(color = "black", face = "italic", family = "serif"),
+        ) +
+  guides()
+EC_Markers_Heatmap
+```
+
+```{r eval=FALSE, include=FALSE}
+saveRDS(Endothelial_Cells, file = "E:/NM_TRANSPLANT/Nadig_Jaishankar/snRNAseq/Endothelial_Cells.rds")
+```
+
+# Differential Gene Expression
+
+Pairwise differential expression is tested using [**MAST**](https://doi.org/10.1186/s13059-015-0844-5) (`test.use = "MAST"`), a hurdle model designed for single-cell/nucleus data's characteristic bimodal, zero-inflated expression distributions — it explicitly models both the rate of detection and the magnitude of expression among detected nuclei, rather than treating dropout as ordinary noise. For each cell type, three pairwise contrasts are run across the storage/reperfusion timecourse: **10h vs. Baseline** (cold storage effect), **Perfused vs. Baseline** (combined storage + reperfusion effect), and **Perfused vs. 10h** (reperfusion-specific effect, isolated from storage). All tests are restricted to genes upregulated in the first-named group (`only.pos = TRUE`) and use an adjusted p-value threshold of 0.05 for significance; full significant gene lists are written to CSV for each contrast, with the top 20 genes (ranked by adjusted p-value) tabulated in the report below.
+
+**Scope note:** the contrasts below are run specifically within the **Microvascular EC** population, reflecting this study's focus on capillary-level endothelial dysfunction during cold storage.
+
+## Microvascular ECs
+```{r include=FALSE}
+### Reusable function: run MAST DE test, save full significant results to CSV,
+### and return a formatted top-N table for the report
+run_DE_comparison <- function(object, ident.1, ident.2, assay = "RNA",
+                               file_path, top_n = 20) {
+  
+  de_results <- FindMarkers(object,
+                             ident.1 = ident.1,
+                             ident.2 = ident.2,
+                             assay = assay,
+                             only.pos = TRUE,
+                             test.use = "MAST",
+                             verbose = FALSE)
+  
+  de_sig <- subset(de_results, p_val_adj < 0.05)
+  write.csv(de_sig, file = file_path)
+  
+  de_sig$gene <- rownames(de_sig)
+  
+  top_table <- de_sig %>%
+    arrange(p_val_adj, desc(avg_log2FC)) %>%
+    slice_head(n = top_n) %>%
+    select(gene, p_val, avg_log2FC, pct.1, pct.2, p_val_adj)
+  
+  list(all_sig = de_sig, top_table = top_table)
+}
+
+### Render a top-N DE table with consistent styling
+render_DE_table <- function(top_table, caption, ident1_label, ident2_label) {
+  top_table %>%
+    kbl(caption = caption,
+        col.names = c("Gene", "p-value", "avg log2FC",
+                      paste0("% Expr (", ident1_label, ")"),
+                      paste0("% Expr (", ident2_label, ")"),
+                      "Adj. p-value"),
+        digits = c(NA, 3, 3, 1, 1, 3),
+        align = "c",
+        row.names = FALSE) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE, position = "left") %>%
+    row_spec(0, bold = TRUE, color = "white", background = "#4A4A4A") %>%
+    column_spec(3, bold = TRUE) %>%
+    footnote(
+      general = paste0("Genes upregulated in ", ident1_label, " relative to ",
+                        ident2_label, ", tested via MAST (assay = RNA). Table shows top ",
+                        nrow(top_table), " genes by adjusted p-value; full significant gene list saved to CSV."),
+      general_title = "Note: ", footnote_as_chunk = TRUE
+    )
+}
+
+### Base directory for DE gene CSV outputs
+de_output_dir <- "E:/NM_TRANSPLANT/Nadig_Jaishankar/snRNAseq/DE Genes"
+
+# Create Cell Type + Treatment Metadata Slot
+Endothelial_Cells$cell_identity.treatment <- paste(Endothelial_Cells$cell.annotation, Endothelial_Cells$Treatment, sep = "_")
+
+# Perform Differential Expression
+Idents(Endothelial_Cells) <- "cell_identity.treatment"
+DefaultAssay(Endothelial_Cells) <- "RNA"
+```
+
+### Cold Storage
+Differentially expressed genes after cold storage compared to baseline
+```{r}
+Microvascular_10h_vs_Baseline <- run_DE_comparison(
+  Endothelial_Cells,
+  ident.1 = "Microvascular ECs_HTK 10h",
+  ident.2 = "Microvascular ECs_HTK Baseline",
+  file_path = file.path(de_output_dir, "Microvascular_Cold_Storage_UP_Baseline.csv")
+)
+
+render_DE_table(Microvascular_10h_vs_Baseline$top_table,
+                 caption = "Top 20 DE Genes: Microvascular ECs, Cold Storage (10h) vs. Baseline",
+                 ident1_label = "10h", ident2_label = "Baseline")
+```
+
+### Perfusion
+Differentially expressed genes after cold storage/perfusion compared to baseline
+```{r}
+Microvascular_Perfused_vs_Baseline <- run_DE_comparison(
+  Endothelial_Cells,
+  ident.1 = "Microvascular ECs_HTK Perfused",
+  ident.2 = "Microvascular ECs_HTK Baseline",
+  file_path = file.path(de_output_dir, "Microvascular_Perfusion_UP_Baseline.csv")
+)
+
+render_DE_table(Microvascular_Perfused_vs_Baseline$top_table,
+                 caption = "Top 20 DE Genes: Microvascular ECs, Perfusion vs. Baseline",
+                 ident1_label = "Perfused", ident2_label = "Baseline")
+```
+
+### Perfusion versus Cold Storage
+Genes upregulated after perfusion relative to cold storage (i.e., genes induced specifically by reperfusion, on top of storage).
+```{r}
+Microvascular_Perfused_vs_10h <- run_DE_comparison(
+  Endothelial_Cells,
+  ident.1 = "Microvascular ECs_HTK Perfused",
+  ident.2 = "Microvascular ECs_HTK 10h",
+  file_path = file.path(de_output_dir, "Microvascular_Perfusion_UP_Cold_Storage.csv")
+)
+
+render_DE_table(Microvascular_Perfused_vs_10h$top_table,
+                 caption = "Top 20 DE Genes: Microvascular ECs, Perfusion vs. Cold Storage (10h)",
+                 ident1_label = "Perfused", ident2_label = "10h")
+```
+
+Genes upregulated during cold storage relative to perfusion.
+```{r}
+Microvascular_10h_vs_Perfused <- run_DE_comparison(
+  Endothelial_Cells,
+  ident.1 = "Microvascular ECs_HTK 10h",
+  ident.2 = "Microvascular ECs_HTK Perfused",
+  file_path = file.path(de_output_dir, "Microvascular_Cold_Storage_UP_Perfusion.csv")
+)
+
+render_DE_table(Microvascular_10h_vs_Perfused$top_table,
+                 caption = "Top 20 DE Genes: Microvascular ECs, Cold Storage (10h) vs. Perfusion",
+                 ident1_label = "10h", ident2_label = "Perfused")
+```
+
+## Microvascular Visualizations
+
+Having identified differentially expressed genes above, the following panels visualize a targeted set of endothelial cell-cell junction genes within the Microvascular EC population specifically — motivated by the hypothesis that cold storage and reperfusion disrupt endothelial barrier integrity via junctional remodeling. The Microvascular EC population is isolated from the broader endothelial subset for these figures.
+
+```{r fig.height=6, fig.width=10}
+DefaultAssay(Endothelial_Cells) <- "RNA"
+Idents(Endothelial_Cells) <- "cell.annotation"
+
+Microvascular <- subset(Endothelial_Cells, idents = c("Microvascular ECs"))
+```
+
+### Figure 1E: Expression of Cell Junction Genes
+
+A curated panel of adherens junction, tight junction, and gap junction genes (e.g., `CDH5`, `CLDN5`, `TJP1`, `GJA1`) is plotted across treatment groups to assess whether junctional gene expression changes with storage duration or reperfusion status.
+
+```{r fig.height=2, fig.width=10}
+Idents(Microvascular) <- "Treatment"
+DefaultAssay(Microvascular) <- "RNA"
+features.markers <- c( "ACTB", "CLDN5", "MSN", "EDNRB", "GJA1", "DBN1", "ICAM1", "CTNNB1", "CTNNA1", "TJP1", "CDH5", "AFDN", "DLG1")
+
+Dotplot <- DotPlot(Microvascular, features = features.markers, cols = c("gray95", "deepskyblue4"), scale.min = 0, scale.max = 50) + 
+  theme(axis.title = element_blank(),
+        axis.text.x = element_text(family = "serif", angle = 45, vjust = 1, hjust = 1, size = rel(1.2)),
+        axis.text.y = element_text(family = "serif", size = rel(1)),
+        legend.text = element_text(family = "serif"),
+        legend.title = element_text(family = "serif"))
+
+Dotplot
+```
+
+### Figure 1F: Violin Plot of Cell Junction Genes
+A subset of four junction genes from Figure 1E (`CLDN5`, `GJA1`, `TJP1`, `CDH5`) is shown as per-nucleus violin plots by treatment, providing a higher-resolution view of the expression distribution — including spread and bimodality — that a dot plot's summary statistics can obscure.
+
+```{r fig.height=3, fig.width=8}
+features.vln <- c("CLDN5", "GJA1", "TJP1", "CDH5")
+Idents(Microvascular) <- "Treatment"
+
+VlnPlot <- VlnPlot(Microvascular, features = features.vln, cols = treatment_colors, pt.size = 0.2, alpha = 0.5, combine = F)
+for(i in 1:(length(VlnPlot))) {
+    VlnPlot[[i]] <- VlnPlot[[i]] +  ggtitle(features.vln[[i]]) + ylab("Expression") + 
+      theme(plot.title = element_text(face = "bold.italic", family = "serif", size = rel(1.2)), 
+            axis.title.x = element_blank(), 
+            axis.title.y = element_text(family = "serif", size = rel(1)), 
+            axis.text.x = element_text(family = "serif", size = rel(1)),
+            axis.text.y = element_blank(), 
+            axis.ticks.y = element_blank()) + 
+      NoLegend()
+}
+
+VlnPlot <- cowplot::plot_grid(plotlist = VlnPlot, ncol = 4, rel_heights = c(rep(1, (length(VlnPlot)-1)), 1.5))
+VlnPlot
+```
+
+### Supplemental Figure 1E: Connexin-43 and Interactors
+`GJA1` (encoding Connexin-43, the primary gap junction protein in vascular endothelium) is shown alongside three of its known scaffolding/interacting partners (`DBN1`, `TJP1`, `DLG1`) to examine whether the broader Connexin-43 interactome shifts coordinately with `GJA1` itself across treatment groups.
+
+```{r fig.height=2, fig.width=5}
+Idents(Microvascular) <- "Treatment"
+DefaultAssay(Microvascular) <- "RNA"
+features.markers <- c("GJA1", "DBN1", "TJP1", "DLG1")
+
+Dotplot <- DotPlot(Microvascular, features = features.markers, cols = c("gray95", "deepskyblue4"), scale.min = 0, scale.max = 30) + 
+  theme(axis.title = element_blank(),
+        axis.text.x = element_text(family = "serif", angle = 45, vjust = 1, hjust = 1, size = rel(1.2)),
+        axis.text.y = element_text(family = "serif", size = rel(1)),
+        legend.text = element_text(family = "serif"),
+        legend.title = element_text(family = "serif"))
+
+Dotplot
+```
+
+```{r eval=FALSE, include=FALSE}
+saveRDS(Microvascular, file = "E:/NM_TRANSPLANT/Nadig_Jaishankar/snRNAseq/Microvascular.rds")
+```
+
+# Session Info
+
+For reproducibility, the R session details (package versions, R version, OS) used to generate this report are included below.
+
+```{r session info, echo=FALSE}
+sessionInfo()
+```
